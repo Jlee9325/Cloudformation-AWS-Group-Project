@@ -96,7 +96,7 @@ Resources:
           ToPort: 3306
           SourceSecurityGroupId: !Ref WebSG
 
-  # Web server EC2
+  # Web server EC2 - installs Apache automatically
   WebServer:
     Type: AWS::EC2::Instance
     Properties:
@@ -106,11 +106,19 @@ Resources:
       SubnetId: !Ref PublicSubnet
       SecurityGroupIds:
         - !Ref WebSG
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          yum update -y
+          yum install -y httpd
+          systemctl enable httpd
+          systemctl start httpd
+          echo "<h1>Web tier is up</h1><p>This EC2 is in the public subnet.</p>" > /var/www/html/index.html
       Tags:
         - Key: Name
           Value: WebServer
 
-  # Database EC2 (in the private subnet)
+  # Database EC2 (in the private subnet) - installs MariaDB automatically
   DatabaseServer:
     Type: AWS::EC2::Instance
     Properties:
@@ -120,6 +128,13 @@ Resources:
       SubnetId: !Ref PrivateSubnet
       SecurityGroupIds:
         - !Ref DBSG
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          yum update -y
+          yum install -y mariadb-server
+          systemctl enable mariadb
+          systemctl start mariadb
       Tags:
         - Key: Name
           Value: DatabaseServer
