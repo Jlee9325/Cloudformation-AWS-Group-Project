@@ -8,7 +8,8 @@ import boto3
 
 STACK_NAME = "MyVPCStack"
 TEMPLATE_FILE = "cloudformation/vpc-web-db.yaml"
-KEY_NAME = "twotier-key"   # change this to your key pair name
+KEY_NAME = "MADJ-DB-Keys"   # change this to your key pair name
+KEY_NAME = "MADJ-Web-Keys" 
 REGION = "us-east-1"
 
 cf = boto3.client("cloudformation", region_name=REGION)
