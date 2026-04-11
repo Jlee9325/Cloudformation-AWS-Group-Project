@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: My two-tier VPC assignment
+Description: MADJ two-tier VPC assignment
 
 Parameters:
   KeyName:
@@ -9,71 +9,119 @@ Parameters:
 Resources:
 
   # VPC
-  MyVPC:
+  MADJVPC:
     Type: AWS::EC2::VPC
     Properties:
       CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
       Tags:
         - Key: Name
-          Value: MyVPC
+          Value: MADJ-VPC
 
   # Public subnet for the web server
-  PublicSubnet:
+  MADJPublicSubnet:
     Type: AWS::EC2::Subnet
     Properties:
-      VpcId: !Ref MyVPC
+      VpcId: !Ref MADJVPC
       CidrBlock: 10.0.1.0/24
       MapPublicIpOnLaunch: true
       Tags:
         - Key: Name
-          Value: PublicSubnet
+          Value: MADJ-Public-Subnet
 
   # Private subnet for the database
-  PrivateSubnet:
+  MADJPrivateSubnet:
     Type: AWS::EC2::Subnet
     Properties:
-      VpcId: !Ref MyVPC
+      VpcId: !Ref MADJVPC
       CidrBlock: 10.0.2.0/24
       Tags:
         - Key: Name
-          Value: PrivateSubnet
+          Value: MADJ-Private-Subnet
 
-  # Internet gateway so the web server can reach the internet
-  InternetGateway:
+  # Internet gateway for the public subnet
+  MADJIGW:
     Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: MADJ-IGW
 
   AttachGateway:
     Type: AWS::EC2::VPCGatewayAttachment
     Properties:
-      VpcId: !Ref MyVPC
-      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref MADJVPC
+      InternetGatewayId: !Ref MADJIGW
 
-  # Route table for the public subnet
-  PublicRouteTable:
+  # Elastic IP for the NAT Gateway
+  MADJNatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+
+  # NAT Gateway so private subnet can reach the internet for updates
+  MADJNAT:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt MADJNatEIP.AllocationId
+      SubnetId: !Ref MADJPublicSubnet
+      Tags:
+        - Key: Name
+          Value: MADJ-NAT
+
+  # Public route table
+  MADJPublicRT:
     Type: AWS::EC2::RouteTable
     Properties:
-      VpcId: !Ref MyVPC
+      VpcId: !Ref MADJVPC
+      Tags:
+        - Key: Name
+          Value: MADJ-Public-RT
 
   PublicRoute:
     Type: AWS::EC2::Route
     DependsOn: AttachGateway
     Properties:
-      RouteTableId: !Ref PublicRouteTable
+      RouteTableId: !Ref MADJPublicRT
       DestinationCidrBlock: 0.0.0.0/0
-      GatewayId: !Ref InternetGateway
+      GatewayId: !Ref MADJIGW
 
   PublicSubnetAssoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
-      SubnetId: !Ref PublicSubnet
-      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref MADJPublicSubnet
+      RouteTableId: !Ref MADJPublicRT
+
+  # Private route table (routes through NAT Gateway for outbound only)
+  MADJPrivateRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MADJVPC
+      Tags:
+        - Key: Name
+          Value: MADJ-Private-RT
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref MADJPrivateRT
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref MADJNAT
+
+  PrivateSubnetAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref MADJPrivateSubnet
+      RouteTableId: !Ref MADJPrivateRT
 
   # Security group for the web server (open to internet)
-  WebSG:
+  MADJWebSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: Allow HTTP and SSH
-      VpcId: !Ref MyVPC
+      VpcId: !Ref MADJVPC
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 80
@@ -83,18 +131,28 @@ Resources:
           FromPort: 22
           ToPort: 22
           CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: MADJ-Web-SG
 
   # Security group for the database (only from web server)
-  DBSG:
+  MADJDBSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Only allow MySQL from web server
-      VpcId: !Ref MyVPC
+      GroupDescription: Only allow MySQL and SSH from web server
+      VpcId: !Ref MADJVPC
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 3306
           ToPort: 3306
-          SourceSecurityGroupId: !Ref WebSG
+          SourceSecurityGroupId: !Ref MADJWebSG
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref MADJWebSG
+      Tags:
+        - Key: Name
+          Value: MADJ-DB-SG
 
   # Web server EC2 - installs Apache automatically
   WebServer:
@@ -103,9 +161,9 @@ Resources:
       ImageId: ami-0c02fb55956c7d316
       InstanceType: t2.micro
       KeyName: !Ref KeyName
-      SubnetId: !Ref PublicSubnet
+      SubnetId: !Ref MADJPublicSubnet
       SecurityGroupIds:
-        - !Ref WebSG
+        - !Ref MADJWebSG
       UserData:
         Fn::Base64: |
           #!/bin/bash
@@ -125,9 +183,9 @@ Resources:
       ImageId: ami-0c02fb55956c7d316
       InstanceType: t2.micro
       KeyName: !Ref KeyName
-      SubnetId: !Ref PrivateSubnet
+      SubnetId: !Ref MADJPrivateSubnet
       SecurityGroupIds:
-        - !Ref DBSG
+        - !Ref MADJDBSG
       UserData:
         Fn::Base64: |
           #!/bin/bash
@@ -143,3 +201,6 @@ Outputs:
   WebServerIP:
     Description: Public IP of the web server
     Value: !GetAtt WebServer.PublicIp
+  DatabasePrivateIP:
+    Description: Private IP of the database server
+    Value: !GetAtt DatabaseServer.PrivateIp
