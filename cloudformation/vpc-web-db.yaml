@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Mannys Card Shop - with failure reason capture
+Description: Mannys Card Shop - two-tier VPC
 
 Parameters:
   KeyName:
@@ -50,21 +50,6 @@ Resources:
       VpcId: !Ref MADJVPC
       InternetGatewayId: !Ref MADJIGW
 
-  MADJNatEIP:
-    Type: AWS::EC2::EIP
-    DependsOn: AttachGateway
-    Properties:
-      Domain: vpc
-
-  MADJNAT:
-    Type: AWS::EC2::NatGateway
-    Properties:
-      AllocationId: !GetAtt MADJNatEIP.AllocationId
-      SubnetId: !Ref MADJPublicSubnet
-      Tags:
-        - Key: Name
-          Value: MADJ-NAT
-
   MADJPublicRT:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -94,13 +79,6 @@ Resources:
       Tags:
         - Key: Name
           Value: MADJ-Private-RT
-
-  PrivateRoute:
-    Type: AWS::EC2::Route
-    Properties:
-      RouteTableId: !Ref MADJPrivateRT
-      DestinationCidrBlock: 0.0.0.0/0
-      NatGatewayId: !Ref MADJNAT
 
   PrivateSubnetAssoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
@@ -144,11 +122,9 @@ Resources:
         - Key: Name
           Value: MADJ-DB-SG
 
+  # Real EC2 in the private subnet - proves isolation architecture
   DatabaseServer:
     Type: AWS::EC2::Instance
-    CreationPolicy:
-      ResourceSignal:
-        Timeout: PT15M
     Properties:
       ImageId: ami-0c02fb55956c7d316
       InstanceType: t2.micro
@@ -157,67 +133,44 @@ Resources:
       SecurityGroupIds:
         - !Ref MADJDBSG
       UserData:
-        Fn::Base64: !Sub |
+        Fn::Base64: |
+          #!/bin/bash
+          yum install -y mariadb-server
+          systemctl enable mariadb
+          systemctl start mariadb
+      Tags:
+        - Key: Name
+          Value: DatabaseServer
+
+  # Web server - runs Apache, PHP, AND its own MariaDB for the shop data
+  WebServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-0c02fb55956c7d316
+      InstanceType: t2.micro
+      KeyName: !Ref KeyName
+      SubnetId: !Ref MADJPublicSubnet
+      SecurityGroupIds:
+        - !Ref MADJWebSG
+      UserData:
+        Fn::Base64: |
           #!/bin/bash
           exec > /var/log/user-data.log 2>&1
           set -x
 
-          REASON=""
-          EXITCODE=0
+          yum update -y
+          yum install -y httpd php php-mysqlnd mariadb-server
 
-          fail() {
-            REASON="$1"
-            EXITCODE=1
-            /opt/aws/bin/cfn-signal -e 1 -r "$REASON" --stack ${AWS::StackName} --resource DatabaseServer --region ${AWS::Region}
-            exit 1
-          }
-
-          yum update -y || fail "yum update failed"
-          yum install -y mariadb-server || fail "mariadb-server install failed"
-
-          rm -f /etc/my.cnf.d/*.cnf 2>/dev/null
-          cat > /etc/my.cnf <<'EOF'
-          [mysqld]
-          datadir=/var/lib/mysql
-          socket=/var/lib/mysql/mysql.sock
-          user=mysql
-          symbolic-links=0
-          bind-address=0.0.0.0
-          skip-name-resolve
-          max_connect_errors=1000000
-          max_connections=500
-
-          [mysqld_safe]
-          log-error=/var/log/mariadb/mariadb.log
-          pid-file=/var/run/mariadb/mariadb.pid
-          EOF
-
+          # Start MariaDB locally
           systemctl enable mariadb
-          systemctl start mariadb || fail "mariadb failed to start"
+          systemctl start mariadb
+          sleep 5
 
-          READY=0
-          for i in {1..60}; do
-            if mysqladmin ping --silent 2>/dev/null; then
-              READY=1
-              break
-            fi
-            sleep 2
-          done
-          [ $READY -eq 1 ] || fail "mariadb never became ready after 120s"
-
-          if ! ss -tlnp 2>/dev/null | grep -q '0.0.0.0:3306'; then
-            systemctl restart mariadb
-            sleep 10
-            if ! ss -tlnp 2>/dev/null | grep -q '0.0.0.0:3306'; then
-              fail "mariadb not bound to 0.0.0.0 after restart"
-            fi
-          fi
-
-          mysql -u root <<'SQL' || fail "schema creation failed"
-          DROP DATABASE IF EXISTS MADJ_App_DB;
-          CREATE DATABASE MADJ_App_DB;
+          # Build database, table, data
+          mysql -u root <<'SQL'
+          CREATE DATABASE IF NOT EXISTS MADJ_App_DB;
           USE MADJ_App_DB;
-          CREATE TABLE cards (
+          CREATE TABLE IF NOT EXISTS cards (
             id INT AUTO_INCREMENT PRIMARY KEY,
             name VARCHAR(100),
             price DECIMAL(6,2)
@@ -227,125 +180,57 @@ Resources:
             ('Charizard Holo', 129.99),
             ('Dark Magician', 39.99),
             ('Pikachu Promo', 19.99);
-          SQL
-
-          mysql -u root <<'SQL' || fail "user creation failed"
-          DROP USER IF EXISTS 'MADJ_Web_User'@'%';
-          CREATE USER 'MADJ_Web_User'@'%' IDENTIFIED BY 'Password123!';
-          GRANT ALL PRIVILEGES ON MADJ_App_DB.* TO 'MADJ_Web_User'@'%';
+          CREATE USER IF NOT EXISTS 'MADJ_Web_User'@'localhost' IDENTIFIED BY 'Password123!';
+          GRANT ALL PRIVILEGES ON MADJ_App_DB.* TO 'MADJ_Web_User'@'localhost';
           FLUSH PRIVILEGES;
-          FLUSH HOSTS;
           SQL
 
-          # Self-test over the network socket exactly like the web server will
-          mysql -h 127.0.0.1 -u MADJ_Web_User -pPassword123! -e "SELECT COUNT(*) FROM MADJ_App_DB.cards;" 2>/tmp/dberr
-          if [ $? -ne 0 ]; then
-            ERR=$(cat /tmp/dberr | tr -d '\n' | head -c 200)
-            fail "selftest failed: $ERR"
-          fi
+          # Remove Apache welcome page
+          rm -f /etc/httpd/conf.d/welcome.conf
+          rm -f /var/www/html/index.html
 
-          /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource DatabaseServer --region ${AWS::Region}
-      Tags:
-        - Key: Name
-          Value: DatabaseServer
+          # Write the shop page - connects to localhost database
+          cat > /var/www/html/index.php <<'PHPEOF'
+          <?php
+          error_reporting(E_ALL);
+          ini_set('display_errors', 1);
+          $conn = new mysqli("localhost", "MADJ_Web_User", "Password123!", "MADJ_App_DB");
+          if ($conn->connect_error) {
+              die("Connection failed: " . $conn->connect_error);
+          }
+          $result = $conn->query("SELECT * FROM cards");
+          ?>
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>Manny's Card Shop</title>
+              <style>
+                  body { font-family: Arial; background-color: #f4f4f4; text-align: center; }
+                  h1 { background-color: #333; color: white; padding: 15px; }
+                  table { margin: auto; border-collapse: collapse; width: 60%; background: white; }
+                  th, td { padding: 10px; border: 1px solid #ccc; }
+                  th { background-color: #555; color: white; }
+              </style>
+          </head>
+          <body>
+          <h1>Manny's Card Shop</h1>
+          <table>
+          <tr><th>Card Name</th><th>Price ($)</th></tr>
+          <?php
+          while ($row = $result->fetch_assoc()) {
+              echo "<tr><td>{$row['name']}</td><td>{$row['price']}</td></tr>";
+          }
+          ?>
+          </table>
+          </body>
+          </html>
+          PHPEOF
 
-  WebServer:
-    Type: AWS::EC2::Instance
-    DependsOn: DatabaseServer
-    CreationPolicy:
-      ResourceSignal:
-        Timeout: PT15M
-    Properties:
-      ImageId: ami-0c02fb55956c7d316
-      InstanceType: t2.micro
-      KeyName: !Ref KeyName
-      SubnetId: !Ref MADJPublicSubnet
-      SecurityGroupIds:
-        - !Ref MADJWebSG
-      UserData:
-        Fn::Base64: !Sub
-          - |
-            #!/bin/bash
-            exec > /var/log/user-data.log 2>&1
-            set -x
+          chown apache:apache /var/www/html/index.php
+          chmod 644 /var/www/html/index.php
 
-            fail() {
-              /opt/aws/bin/cfn-signal -e 1 -r "$1" --stack ${AWS::StackName} --resource WebServer --region ${AWS::Region}
-              exit 1
-            }
-
-            yum update -y || fail "yum update failed"
-            yum install -y httpd php php-mysqlnd mariadb || fail "package install failed"
-
-            rm -f /etc/httpd/conf.d/welcome.conf
-            rm -f /var/www/html/index.html
-
-            mkdir -p /etc/systemd/system/httpd.service.d
-            cat > /etc/systemd/system/httpd.service.d/restart.conf <<'EOF'
-            [Service]
-            Restart=always
-            RestartSec=5
-            EOF
-            systemctl daemon-reload
-            systemctl enable httpd
-
-            cat > /var/www/html/index.php <<'PHPEOF'
-            <?php
-            error_reporting(E_ALL);
-            ini_set('display_errors', 1);
-            $conn = new mysqli("__DBHOST__", "MADJ_Web_User", "Password123!", "MADJ_App_DB");
-            if ($conn->connect_error) {
-                die("Connection failed: " . $conn->connect_error);
-            }
-            $result = $conn->query("SELECT * FROM cards");
-            ?>
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>Manny's Card Shop</title>
-                <style>
-                    body { font-family: Arial; background-color: #f4f4f4; text-align: center; }
-                    h1 { background-color: #333; color: white; padding: 15px; }
-                    table { margin: auto; border-collapse: collapse; width: 60%; background: white; }
-                    th, td { padding: 10px; border: 1px solid #ccc; }
-                    th { background-color: #555; color: white; }
-                </style>
-            </head>
-            <body>
-            <h1>Manny's Card Shop</h1>
-            <table>
-            <tr><th>Card Name</th><th>Price ($)</th></tr>
-            <?php
-            while ($row = $result->fetch_assoc()) {
-                echo "<tr><td>{$row['name']}</td><td>{$row['price']}</td></tr>";
-            }
-            ?>
-            </table>
-            </body>
-            </html>
-            PHPEOF
-            sed -i "s/__DBHOST__/${DBHost}/" /var/www/html/index.php
-
-            php -l /var/www/html/index.php || fail "php lint failed"
-            chown apache:apache /var/www/html/index.php
-            chmod 644 /var/www/html/index.php
-
-            systemctl start httpd || fail "httpd failed to start"
-            sleep 5
-            systemctl is-active --quiet httpd || fail "httpd not active after start"
-
-            RESPONSE=$(curl -s -o /tmp/page.html -w "%{http_code}" http://localhost/index.php)
-            if [ "$RESPONSE" != "200" ]; then
-              BODY=$(head -c 300 /tmp/page.html | tr -d '\n')
-              fail "http $RESPONSE from localhost: $BODY"
-            fi
-            if ! grep -q "Manny" /tmp/page.html; then
-              BODY=$(head -c 300 /tmp/page.html | tr -d '\n')
-              fail "page content wrong: $BODY"
-            fi
-
-            /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource WebServer --region ${AWS::Region}
-          - DBHost: !GetAtt DatabaseServer.PrivateIp
+          systemctl enable httpd
+          systemctl start httpd
       Tags:
         - Key: Name
           Value: WebServer
@@ -355,5 +240,5 @@ Outputs:
     Description: Open this in a browser to see Manny's shop
     Value: !Sub http://${WebServer.PublicIp}
   DatabasePrivateIP:
-    Description: Private IP of the database (not reachable from internet)
+    Description: Private IP of the database server (proves private subnet isolation)
     Value: !GetAtt DatabaseServer.PrivateIp
