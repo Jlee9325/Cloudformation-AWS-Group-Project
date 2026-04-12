@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: MADJ two-tier VPC assignment
+Description: Mannys Card Shop - two-tier VPC with working webapp
 
 Parameters:
   KeyName:
@@ -8,7 +8,6 @@ Parameters:
 
 Resources:
 
-  # VPC
   MADJVPC:
     Type: AWS::EC2::VPC
     Properties:
@@ -19,7 +18,6 @@ Resources:
         - Key: Name
           Value: MADJ-VPC
 
-  # Public subnet for the web server
   MADJPublicSubnet:
     Type: AWS::EC2::Subnet
     Properties:
@@ -30,7 +28,6 @@ Resources:
         - Key: Name
           Value: MADJ-Public-Subnet
 
-  # Private subnet for the database
   MADJPrivateSubnet:
     Type: AWS::EC2::Subnet
     Properties:
@@ -40,7 +37,6 @@ Resources:
         - Key: Name
           Value: MADJ-Private-Subnet
 
-  # Internet gateway for the public subnet
   MADJIGW:
     Type: AWS::EC2::InternetGateway
     Properties:
@@ -54,14 +50,12 @@ Resources:
       VpcId: !Ref MADJVPC
       InternetGatewayId: !Ref MADJIGW
 
-  # Elastic IP for the NAT Gateway
   MADJNatEIP:
     Type: AWS::EC2::EIP
     DependsOn: AttachGateway
     Properties:
       Domain: vpc
 
-  # NAT Gateway so private subnet can reach the internet for updates
   MADJNAT:
     Type: AWS::EC2::NatGateway
     Properties:
@@ -71,7 +65,6 @@ Resources:
         - Key: Name
           Value: MADJ-NAT
 
-  # Public route table
   MADJPublicRT:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -94,7 +87,6 @@ Resources:
       SubnetId: !Ref MADJPublicSubnet
       RouteTableId: !Ref MADJPublicRT
 
-  # Private route table (routes through NAT Gateway for outbound only)
   MADJPrivateRT:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -116,7 +108,6 @@ Resources:
       SubnetId: !Ref MADJPrivateSubnet
       RouteTableId: !Ref MADJPrivateRT
 
-  # Security group for the web server (open to internet)
   MADJWebSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -135,7 +126,6 @@ Resources:
         - Key: Name
           Value: MADJ-Web-SG
 
-  # Security group for the database (only from web server)
   MADJDBSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -154,29 +144,6 @@ Resources:
         - Key: Name
           Value: MADJ-DB-SG
 
-  # Web server EC2 - installs Apache automatically
-  WebServer:
-    Type: AWS::EC2::Instance
-    Properties:
-      ImageId: ami-0c02fb55956c7d316
-      InstanceType: t2.micro
-      KeyName: !Ref KeyName
-      SubnetId: !Ref MADJPublicSubnet
-      SecurityGroupIds:
-        - !Ref MADJWebSG
-      UserData:
-        Fn::Base64: |
-          #!/bin/bash
-          yum update -y
-          yum install -y httpd
-          systemctl enable httpd
-          systemctl start httpd
-          echo "<h1>Web tier is up</h1><p>This EC2 is in the public subnet.</p>" > /var/www/html/index.html
-      Tags:
-        - Key: Name
-          Value: WebServer
-
-  # Database EC2 (in the private subnet) - installs MariaDB automatically
   DatabaseServer:
     Type: AWS::EC2::Instance
     Properties:
@@ -191,16 +158,127 @@ Resources:
           #!/bin/bash
           yum update -y
           yum install -y mariadb-server
+          cat > /etc/my.cnf.d/bind.cnf <<EOF
+          [mysqld]
+          bind-address=0.0.0.0
+          EOF
           systemctl enable mariadb
           systemctl start mariadb
+          sleep 5
+          mysql -u root <<SQL
+          CREATE DATABASE MADJ_App_DB;
+          USE MADJ_App_DB;
+          CREATE TABLE cards (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(100),
+            price DECIMAL(6,2)
+          );
+          INSERT INTO cards (name, price) VALUES
+            ('Blue-Eyes White Dragon', 49.99),
+            ('Charizard Holo', 129.99),
+            ('Dark Magician', 39.99),
+            ('Pikachu Promo', 19.99);
+          CREATE USER 'MADJ_Web_User'@'%' IDENTIFIED BY 'Password123!';
+          GRANT ALL PRIVILEGES ON MADJ_App_DB.* TO 'MADJ_Web_User'@'%';
+          FLUSH PRIVILEGES;
+          SQL
       Tags:
         - Key: Name
           Value: DatabaseServer
 
+  WebServer:
+    Type: AWS::EC2::Instance
+    DependsOn: DatabaseServer
+    Properties:
+      ImageId: ami-0c02fb55956c7d316
+      InstanceType: t2.micro
+      KeyName: !Ref KeyName
+      SubnetId: !Ref MADJPublicSubnet
+      SecurityGroupIds:
+        - !Ref MADJWebSG
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd php php-mysqlnd
+            systemctl enable httpd
+            systemctl start httpd
+            for i in {1..30}; do
+              if timeout 3 bash -c "cat < /dev/tcp/${DBHost}/3306" 2>/dev/null; then
+                break
+              fi
+              sleep 10
+            done
+            cat > /var/www/html/index.php <<'PHPEOF'
+            <?php
+            error_reporting(E_ALL);
+            ini_set('display_errors', 1);
+            $conn = new mysqli("__DBHOST__", "MADJ_Web_User", "Password123!", "MADJ_App_DB");
+            if ($conn->connect_error) {
+                die("Connection failed: " . $conn->connect_error);
+            }
+            $result = $conn->query("SELECT * FROM cards");
+            ?>
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Manny's Card Shop</title>
+                <style>
+                    body {
+                        font-family: Arial;
+                        background-color: #f4f4f4;
+                        text-align: center;
+                    }
+                    h1 {
+                        background-color: #333;
+                        color: white;
+                        padding: 15px;
+                    }
+                    table {
+                        margin: auto;
+                        border-collapse: collapse;
+                        width: 60%;
+                        background: white;
+                    }
+                    th, td {
+                        padding: 10px;
+                        border: 1px solid #ccc;
+                    }
+                    th {
+                        background-color: #555;
+                        color: white;
+                    }
+                </style>
+            </head>
+            <body>
+            <h1>Manny's Card Shop</h1>
+            <table>
+            <tr>
+                <th>Card Name</th>
+                <th>Price ($)</th>
+            </tr>
+            <?php
+            while ($row = $result->fetch_assoc()) {
+                echo "<tr><td>{$row['name']}</td><td>{$row['price']}</td></tr>";
+            }
+            ?>
+            </table>
+            </body>
+            </html>
+            PHPEOF
+            sed -i "s/__DBHOST__/${DBHost}/" /var/www/html/index.php
+            rm -f /var/www/html/index.html
+            systemctl restart httpd
+          - DBHost: !GetAtt DatabaseServer.PrivateIp
+      Tags:
+        - Key: Name
+          Value: WebServer
+
 Outputs:
-  WebServerIP:
-    Description: Public IP of the web server
-    Value: !GetAtt WebServer.PublicIp
+  WebServerURL:
+    Description: Open this in a browser to see Manny's shop
+    Value: !Sub http://${WebServer.PublicIp}
   DatabasePrivateIP:
-    Description: Private IP of the database server
+    Description: Private IP of the database (not reachable from internet)
     Value: !GetAtt DatabaseServer.PrivateIp
