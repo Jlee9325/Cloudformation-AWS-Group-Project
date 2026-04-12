@@ -1,18 +1,14 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Mannys Pokemon Card Shop - two-tier VPC with working webapp
+Description: MADJ two-tier VPC assignment
 
 Parameters:
   KeyName:
     Type: AWS::EC2::KeyPair::KeyName
     Description: Name of my EC2 key pair
-  DBPassword:
-    Type: String
-    Description: Password for the webapp database user
-    NoEcho: true
-    Default: MadjPass123
 
 Resources:
 
+  # VPC
   MADJVPC:
     Type: AWS::EC2::VPC
     Properties:
@@ -23,6 +19,7 @@ Resources:
         - Key: Name
           Value: MADJ-VPC
 
+  # Public subnet for the web server
   MADJPublicSubnet:
     Type: AWS::EC2::Subnet
     Properties:
@@ -33,6 +30,7 @@ Resources:
         - Key: Name
           Value: MADJ-Public-Subnet
 
+  # Private subnet for the database
   MADJPrivateSubnet:
     Type: AWS::EC2::Subnet
     Properties:
@@ -42,6 +40,7 @@ Resources:
         - Key: Name
           Value: MADJ-Private-Subnet
 
+  # Internet gateway for the public subnet
   MADJIGW:
     Type: AWS::EC2::InternetGateway
     Properties:
@@ -55,12 +54,14 @@ Resources:
       VpcId: !Ref MADJVPC
       InternetGatewayId: !Ref MADJIGW
 
+  # Elastic IP for the NAT Gateway
   MADJNatEIP:
     Type: AWS::EC2::EIP
     DependsOn: AttachGateway
     Properties:
       Domain: vpc
 
+  # NAT Gateway so private subnet can reach the internet for updates
   MADJNAT:
     Type: AWS::EC2::NatGateway
     Properties:
@@ -70,6 +71,7 @@ Resources:
         - Key: Name
           Value: MADJ-NAT
 
+  # Public route table
   MADJPublicRT:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -92,6 +94,7 @@ Resources:
       SubnetId: !Ref MADJPublicSubnet
       RouteTableId: !Ref MADJPublicRT
 
+  # Private route table (routes through NAT Gateway for outbound only)
   MADJPrivateRT:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -113,6 +116,7 @@ Resources:
       SubnetId: !Ref MADJPrivateSubnet
       RouteTableId: !Ref MADJPrivateRT
 
+  # Security group for the web server (open to internet)
   MADJWebSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -131,6 +135,7 @@ Resources:
         - Key: Name
           Value: MADJ-Web-SG
 
+  # Security group for the database (only from web server)
   MADJDBSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -149,6 +154,29 @@ Resources:
         - Key: Name
           Value: MADJ-DB-SG
 
+  # Web server EC2 - installs Apache automatically
+  WebServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-0c02fb55956c7d316
+      InstanceType: t2.micro
+      KeyName: !Ref KeyName
+      SubnetId: !Ref MADJPublicSubnet
+      SecurityGroupIds:
+        - !Ref MADJWebSG
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          yum update -y
+          yum install -y httpd
+          systemctl enable httpd
+          systemctl start httpd
+          echo "<h1>Web tier is up</h1><p>This EC2 is in the public subnet.</p>" > /var/www/html/index.html
+      Tags:
+        - Key: Name
+          Value: WebServer
+
+  # Database EC2 (in the private subnet) - installs MariaDB automatically
   DatabaseServer:
     Type: AWS::EC2::Instance
     Properties:
@@ -159,165 +187,20 @@ Resources:
       SecurityGroupIds:
         - !Ref MADJDBSG
       UserData:
-        Fn::Base64: !Sub |
+        Fn::Base64: |
           #!/bin/bash
           yum update -y
           yum install -y mariadb-server
           systemctl enable mariadb
           systemctl start mariadb
-          echo "[mysqld]" >> /etc/my.cnf
-          echo "bind-address=0.0.0.0" >> /etc/my.cnf
-          systemctl restart mariadb
-          mysql -u root <<SQL
-          CREATE DATABASE mannyshop;
-          USE mannyshop;
-          CREATE TABLE cards (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            name VARCHAR(100) NOT NULL,
-            rarity VARCHAR(50) NOT NULL,
-            price DECIMAL(8,2) NOT NULL,
-            stock INT NOT NULL DEFAULT 0
-          );
-          INSERT INTO cards (name, rarity, price, stock) VALUES
-            ('Charizard', 'Holo Rare', 249.99, 3),
-            ('Pikachu', 'Common', 4.99, 50),
-            ('Blastoise', 'Holo Rare', 189.99, 5),
-            ('Venusaur', 'Holo Rare', 179.99, 4),
-            ('Mewtwo', 'Ultra Rare', 329.99, 2),
-            ('Mew', 'Secret Rare', 399.99, 1),
-            ('Gengar', 'Rare', 59.99, 12),
-            ('Snorlax', 'Rare', 39.99, 15);
-          CREATE USER 'webapp'@'%' IDENTIFIED BY '${DBPassword}';
-          GRANT ALL PRIVILEGES ON mannyshop.* TO 'webapp'@'%';
-          FLUSH PRIVILEGES;
-          SQL
       Tags:
         - Key: Name
           Value: DatabaseServer
 
-  WebServer:
-    Type: AWS::EC2::Instance
-    DependsOn: DatabaseServer
-    Properties:
-      ImageId: ami-0c02fb55956c7d316
-      InstanceType: t2.micro
-      KeyName: !Ref KeyName
-      SubnetId: !Ref MADJPublicSubnet
-      SecurityGroupIds:
-        - !Ref MADJWebSG
-      UserData:
-        Fn::Base64: !Sub
-          - |
-            #!/bin/bash
-            yum update -y
-            yum install -y httpd php php-mysqlnd
-            systemctl enable httpd
-            systemctl start httpd
-            for i in {1..30}; do
-              if mysqladmin ping -h ${DBHost} -u webapp -p${DBPassword} --silent 2>/dev/null; then
-                break
-              fi
-              sleep 10
-            done
-            cat > /var/www/html/config.php <<PHPCONF
-            <?php
-            \$dbhost = '${DBHost}';
-            \$dbuser = 'webapp';
-            \$dbpass = '${DBPassword}';
-            \$dbname = 'mannyshop';
-            ?>
-            PHPCONF
-            cat > /var/www/html/index.php <<'PHPEOF'
-            <?php
-            require 'config.php';
-            $db = new mysqli($dbhost, $dbuser, $dbpass, $dbname);
-            if ($db->connect_error) { die('DB connection failed: ' . $db->connect_error); }
-
-            if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-              if (isset($_POST['buy_id'])) {
-                $id = (int)$_POST['buy_id'];
-                $db->query("UPDATE cards SET stock = stock - 1 WHERE id = $id AND stock > 0");
-                $msg = 'Purchase successful! Thanks for shopping at Manny\'s.';
-              } elseif (isset($_POST['new_name'])) {
-                $n = $db->real_escape_string($_POST['new_name']);
-                $r = $db->real_escape_string($_POST['new_rarity']);
-                $p = (float)$_POST['new_price'];
-                $s = (int)$_POST['new_stock'];
-                if ($n && $r) {
-                  $db->query("INSERT INTO cards (name, rarity, price, stock) VALUES ('$n', '$r', $p, $s)");
-                  $msg = "Added $n to inventory.";
-                }
-              }
-            }
-            $cards = $db->query("SELECT * FROM cards ORDER BY price DESC");
-            ?>
-            <!doctype html>
-            <html>
-            <head>
-              <title>Manny's Pokemon Card Shop</title>
-              <style>
-                body { font-family: -apple-system, sans-serif; max-width: 1000px; margin: 2rem auto; padding: 0 1rem; background: #f5f5f5; }
-                h1 { color: #cc0000; text-align: center; font-size: 2.5rem; margin-bottom: 0; }
-                .tagline { text-align: center; color: #666; margin-top: 0; margin-bottom: 2rem; }
-                .msg { background: #d4edda; color: #155724; padding: 1rem; border-radius: 8px; margin-bottom: 1rem; }
-                .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 1rem; }
-                .card { background: white; border: 2px solid #ffcb05; border-radius: 12px; padding: 1rem; box-shadow: 0 2px 4px rgba(0,0,0,.1); }
-                .card h3 { margin: 0 0 .5rem; color: #3d7dca; }
-                .rarity { display: inline-block; padding: .2rem .6rem; background: #ffcb05; color: #3d7dca; border-radius: 12px; font-size: .8rem; font-weight: bold; }
-                .price { font-size: 1.4rem; font-weight: bold; color: #cc0000; margin: .5rem 0; }
-                .stock { color: #666; font-size: .9rem; }
-                button { background: #3d7dca; color: white; border: none; padding: .5rem 1rem; border-radius: 6px; cursor: pointer; font-size: 1rem; margin-top: .5rem; width: 100%; }
-                button:hover { background: #2a5a9e; }
-                button:disabled { background: #ccc; cursor: not-allowed; }
-                .admin { background: white; border-radius: 12px; padding: 1.5rem; margin-top: 3rem; border: 2px dashed #ccc; }
-                .admin h2 { margin-top: 0; }
-                .admin input { padding: .5rem; margin: .25rem; font-size: 1rem; border: 1px solid #ccc; border-radius: 6px; }
-              </style>
-            </head>
-            <body>
-              <h1>Manny's Pokemon Card Shop</h1>
-              <p class="tagline">Gotta catch 'em all - rare cards, fair prices</p>
-              <?php if (isset($msg)): ?><div class="msg"><?= $msg ?></div><?php endif; ?>
-              <div class="grid">
-                <?php while ($c = $cards->fetch_assoc()): ?>
-                  <div class="card">
-                    <h3><?= htmlspecialchars($c['name']) ?></h3>
-                    <span class="rarity"><?= htmlspecialchars($c['rarity']) ?></span>
-                    <div class="price">$<?= number_format($c['price'], 2) ?></div>
-                    <div class="stock"><?= $c['stock'] ?> in stock</div>
-                    <form method="POST">
-                      <input type="hidden" name="buy_id" value="<?= $c['id'] ?>">
-                      <button <?= $c['stock'] == 0 ? 'disabled' : '' ?>>
-                        <?= $c['stock'] == 0 ? 'Sold Out' : 'Buy Now' ?>
-                      </button>
-                    </form>
-                  </div>
-                <?php endwhile; ?>
-              </div>
-              <div class="admin">
-                <h2>Add New Card (Admin)</h2>
-                <form method="POST">
-                  <input name="new_name" placeholder="Card name" required>
-                  <input name="new_rarity" placeholder="Rarity" required>
-                  <input name="new_price" type="number" step="0.01" placeholder="Price" required>
-                  <input name="new_stock" type="number" placeholder="Stock" required>
-                  <button>Add to inventory</button>
-                </form>
-              </div>
-            </body>
-            </html>
-            PHPEOF
-            rm -f /var/www/html/index.html
-            systemctl restart httpd
-          - DBHost: !GetAtt DatabaseServer.PrivateIp
-      Tags:
-        - Key: Name
-          Value: WebServer
-
 Outputs:
-  WebServerURL:
-    Description: Open this in a browser to see Manny's shop
-    Value: !Sub http://${WebServer.PublicIp}
+  WebServerIP:
+    Description: Public IP of the web server
+    Value: !GetAtt WebServer.PublicIp
   DatabasePrivateIP:
-    Description: Private IP of the database (not reachable from internet)
+    Description: Private IP of the database server
     Value: !GetAtt DatabaseServer.PrivateIp
