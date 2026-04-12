@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Mannys Card Shop - two-tier VPC with working webapp
+Description: Mannys Card Shop - two-tier VPC with signal-based readiness
 
 Parameters:
   KeyName:
@@ -146,6 +146,9 @@ Resources:
 
   DatabaseServer:
     Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
     Properties:
       ImageId: ami-0c02fb55956c7d316
       InstanceType: t2.micro
@@ -154,15 +157,17 @@ Resources:
       SecurityGroupIds:
         - !Ref MADJDBSG
       UserData:
-        Fn::Base64: |
+        Fn::Base64: !Sub |
           #!/bin/bash
           exec > /var/log/user-data.log 2>&1
           set -x
+
           yum update -y
           yum install -y mariadb-server
 
-          # Write MariaDB config BEFORE first start so it binds correctly
-          cat > /etc/my.cnf <<EOF
+          # Kill any existing MariaDB config and write a known-good one
+          rm -f /etc/my.cnf.d/*.cnf 2>/dev/null
+          cat > /etc/my.cnf <<'EOF'
           [mysqld]
           datadir=/var/lib/mysql
           socket=/var/lib/mysql/mysql.sock
@@ -176,30 +181,32 @@ Resources:
           [mysqld_safe]
           log-error=/var/log/mariadb/mariadb.log
           pid-file=/var/run/mariadb/mariadb.pid
-
-          !includedir /etc/my.cnf.d
           EOF
 
           systemctl enable mariadb
           systemctl start mariadb
 
-          # Wait for MariaDB to actually be ready to accept commands
-          for i in {1..30}; do
+          # Wait for mariadb to actually be ready
+          for i in {1..60}; do
             if mysqladmin ping --silent 2>/dev/null; then
-              echo "MariaDB ready after $i attempts"
               break
             fi
             sleep 2
           done
 
-          # Verify it's listening on 0.0.0.0 before proceeding
-          ss -tlnp | grep 3306
+          # Verify bind-address actually took effect. If not, force it.
+          if ! ss -tlnp 2>/dev/null | grep -q '0.0.0.0:3306'; then
+            echo "ERROR: bind-address did not apply, forcing restart"
+            systemctl restart mariadb
+            sleep 10
+          fi
 
-          # Create database, table, data, and remote user
+          # Build schema
           mysql -u root <<'SQL'
-          CREATE DATABASE IF NOT EXISTS MADJ_App_DB;
+          DROP DATABASE IF EXISTS MADJ_App_DB;
+          CREATE DATABASE MADJ_App_DB;
           USE MADJ_App_DB;
-          CREATE TABLE IF NOT EXISTS cards (
+          CREATE TABLE cards (
             id INT AUTO_INCREMENT PRIMARY KEY,
             name VARCHAR(100),
             price DECIMAL(6,2)
@@ -211,7 +218,7 @@ Resources:
             ('Pikachu Promo', 19.99);
           SQL
 
-          # Create user separately with explicit grant for all hosts
+          # Create the user and force-grant on % (all hosts in VPC)
           mysql -u root <<'SQL'
           DROP USER IF EXISTS 'MADJ_Web_User'@'%';
           CREATE USER 'MADJ_Web_User'@'%' IDENTIFIED BY 'Password123!';
@@ -220,9 +227,12 @@ Resources:
           FLUSH HOSTS;
           SQL
 
-          # Final verification
-          mysql -u root -e "SELECT user, host FROM mysql.user WHERE user='MADJ_Web_User';"
-          echo "DB setup complete"
+          # Self-test: can we authenticate as the web user from this box?
+          mysql -h 127.0.0.1 -u MADJ_Web_User -pPassword123! -e "SELECT COUNT(*) FROM MADJ_App_DB.cards;"
+          SELFTEST=$?
+
+          # Signal CloudFormation only if everything worked
+          /opt/aws/bin/cfn-signal -e $SELFTEST --stack ${AWS::StackName} --resource DatabaseServer --region ${AWS::Region}
       Tags:
         - Key: Name
           Value: DatabaseServer
@@ -230,6 +240,9 @@ Resources:
   WebServer:
     Type: AWS::EC2::Instance
     DependsOn: DatabaseServer
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
     Properties:
       ImageId: ami-0c02fb55956c7d316
       InstanceType: t2.micro
@@ -243,19 +256,16 @@ Resources:
             #!/bin/bash
             exec > /var/log/user-data.log 2>&1
             set -x
+
             yum update -y
             yum install -y httpd php php-mysqlnd mariadb
             systemctl enable httpd
 
-            # Wait for DB — up to 10 minutes. DependsOn only waits for EC2 to start,
-            # not for its UserData to finish, so we poll until MariaDB actually answers.
-            for i in {1..120}; do
-              if mysql -h ${DBHost} -u MADJ_Web_User -pPassword123! -e "SELECT 1" MADJ_App_DB 2>/dev/null; then
-                echo "DB ready after $i attempts"
-                break
-              fi
-              sleep 5
-            done
+            # DB is guaranteed ready because DatabaseServer's CreationPolicy
+            # already blocked until its own self-test passed. But verify once
+            # more to be safe.
+            mysql -h ${DBHost} -u MADJ_Web_User -pPassword123! -e "SELECT 1" MADJ_App_DB
+            DBCHECK=$?
 
             cat > /var/www/html/index.php <<'PHPEOF'
             <?php
@@ -272,39 +282,17 @@ Resources:
             <head>
                 <title>Manny's Card Shop</title>
                 <style>
-                    body {
-                        font-family: Arial;
-                        background-color: #f4f4f4;
-                        text-align: center;
-                    }
-                    h1 {
-                        background-color: #333;
-                        color: white;
-                        padding: 15px;
-                    }
-                    table {
-                        margin: auto;
-                        border-collapse: collapse;
-                        width: 60%;
-                        background: white;
-                    }
-                    th, td {
-                        padding: 10px;
-                        border: 1px solid #ccc;
-                    }
-                    th {
-                        background-color: #555;
-                        color: white;
-                    }
+                    body { font-family: Arial; background-color: #f4f4f4; text-align: center; }
+                    h1 { background-color: #333; color: white; padding: 15px; }
+                    table { margin: auto; border-collapse: collapse; width: 60%; background: white; }
+                    th, td { padding: 10px; border: 1px solid #ccc; }
+                    th { background-color: #555; color: white; }
                 </style>
             </head>
             <body>
             <h1>Manny's Card Shop</h1>
             <table>
-            <tr>
-                <th>Card Name</th>
-                <th>Price ($)</th>
-            </tr>
+            <tr><th>Card Name</th><th>Price ($)</th></tr>
             <?php
             while ($row = $result->fetch_assoc()) {
                 echo "<tr><td>{$row['name']}</td><td>{$row['price']}</td></tr>";
@@ -317,7 +305,13 @@ Resources:
             sed -i "s/__DBHOST__/${DBHost}/" /var/www/html/index.php
             rm -f /var/www/html/index.html
             systemctl start httpd
-            echo "Web setup complete"
+
+            # Final check: is httpd actually serving?
+            sleep 3
+            curl -sf http://localhost/index.php > /dev/null
+            HTTPCHECK=$?
+
+            /opt/aws/bin/cfn-signal -e $((DBCHECK + HTTPCHECK)) --stack ${AWS::StackName} --resource WebServer --region ${AWS::Region}
           - DBHost: !GetAtt DatabaseServer.PrivateIp
       Tags:
         - Key: Name
