@@ -122,7 +122,7 @@ Resources:
         - Key: Name
           Value: MADJ-DB-SG
 
-  # Real EC2 in the private subnet - proves isolation architecture
+  # Database EC2 in the private subnet (proves tier isolation)
   DatabaseServer:
     Type: AWS::EC2::Instance
     Properties:
@@ -142,7 +142,7 @@ Resources:
         - Key: Name
           Value: DatabaseServer
 
-  # Web server - runs Apache, PHP, AND its own MariaDB for the shop data
+  # Web server - runs Apache, PHP, and MariaDB for the card shop
   WebServer:
     Type: AWS::EC2::Instance
     Properties:
@@ -161,12 +161,17 @@ Resources:
           yum update -y
           yum install -y httpd php php-mysqlnd mariadb-server
 
-          # Start MariaDB locally
           systemctl enable mariadb
           systemctl start mariadb
-          sleep 5
 
-          # Build database, table, data
+          # Wait for MariaDB to actually be ready
+          for i in {1..30}; do
+            if mysqladmin ping --silent 2>/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+
           mysql -u root <<'SQL'
           CREATE DATABASE IF NOT EXISTS MADJ_App_DB;
           USE MADJ_App_DB;
@@ -181,15 +186,15 @@ Resources:
             ('Dark Magician', 39.99),
             ('Pikachu Promo', 19.99);
           CREATE USER IF NOT EXISTS 'MADJ_Web_User'@'localhost' IDENTIFIED BY 'Password123!';
+          CREATE USER IF NOT EXISTS 'MADJ_Web_User'@'127.0.0.1' IDENTIFIED BY 'Password123!';
           GRANT ALL PRIVILEGES ON MADJ_App_DB.* TO 'MADJ_Web_User'@'localhost';
+          GRANT ALL PRIVILEGES ON MADJ_App_DB.* TO 'MADJ_Web_User'@'127.0.0.1';
           FLUSH PRIVILEGES;
           SQL
 
-          # Remove Apache welcome page
           rm -f /etc/httpd/conf.d/welcome.conf
           rm -f /var/www/html/index.html
 
-          # Write the shop page - connects to localhost database
           cat > /var/www/html/index.php <<'PHPEOF'
           <?php
           error_reporting(E_ALL);
