@@ -1,10 +1,15 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: MADJ two-tier VPC assignment
+Description: MADJ two-tier VPC assignment with working webapp
 
 Parameters:
   KeyName:
     Type: AWS::EC2::KeyPair::KeyName
     Description: Name of my EC2 key pair
+  DBPassword:
+    Type: String
+    Description: Password for the webapp database user
+    NoEcho: true
+    Default: MadjPass123
 
 Resources:
 
@@ -19,7 +24,6 @@ Resources:
         - Key: Name
           Value: MADJ-VPC
 
-  # Public subnet for the web server
   MADJPublicSubnet:
     Type: AWS::EC2::Subnet
     Properties:
@@ -30,7 +34,6 @@ Resources:
         - Key: Name
           Value: MADJ-Public-Subnet
 
-  # Private subnet for the database
   MADJPrivateSubnet:
     Type: AWS::EC2::Subnet
     Properties:
@@ -40,7 +43,6 @@ Resources:
         - Key: Name
           Value: MADJ-Private-Subnet
 
-  # Internet gateway for the public subnet
   MADJIGW:
     Type: AWS::EC2::InternetGateway
     Properties:
@@ -54,14 +56,12 @@ Resources:
       VpcId: !Ref MADJVPC
       InternetGatewayId: !Ref MADJIGW
 
-  # Elastic IP for the NAT Gateway
   MADJNatEIP:
     Type: AWS::EC2::EIP
     DependsOn: AttachGateway
     Properties:
       Domain: vpc
 
-  # NAT Gateway so private subnet can reach the internet for updates
   MADJNAT:
     Type: AWS::EC2::NatGateway
     Properties:
@@ -71,7 +71,6 @@ Resources:
         - Key: Name
           Value: MADJ-NAT
 
-  # Public route table
   MADJPublicRT:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -94,7 +93,6 @@ Resources:
       SubnetId: !Ref MADJPublicSubnet
       RouteTableId: !Ref MADJPublicRT
 
-  # Private route table (routes through NAT Gateway for outbound only)
   MADJPrivateRT:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -116,7 +114,6 @@ Resources:
       SubnetId: !Ref MADJPrivateSubnet
       RouteTableId: !Ref MADJPrivateRT
 
-  # Security group for the web server (open to internet)
   MADJWebSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -135,7 +132,6 @@ Resources:
         - Key: Name
           Value: MADJ-Web-SG
 
-  # Security group for the database (only from web server)
   MADJDBSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -154,29 +150,7 @@ Resources:
         - Key: Name
           Value: MADJ-DB-SG
 
-  # Web server EC2 - installs Apache automatically
-  WebServer:
-    Type: AWS::EC2::Instance
-    Properties:
-      ImageId: ami-0c02fb55956c7d316
-      InstanceType: t2.micro
-      KeyName: !Ref KeyName
-      SubnetId: !Ref MADJPublicSubnet
-      SecurityGroupIds:
-        - !Ref MADJWebSG
-      UserData:
-        Fn::Base64: |
-          #!/bin/bash
-          yum update -y
-          yum install -y httpd
-          systemctl enable httpd
-          systemctl start httpd
-          echo "<h1>Web tier is up</h1><p>This EC2 is in the public subnet.</p>" > /var/www/html/index.html
-      Tags:
-        - Key: Name
-          Value: WebServer
-
-  # Database EC2 (in the private subnet) - installs MariaDB automatically
+  # Database server - builds first so web server can connect on boot
   DatabaseServer:
     Type: AWS::EC2::Instance
     Properties:
@@ -187,20 +161,117 @@ Resources:
       SecurityGroupIds:
         - !Ref MADJDBSG
       UserData:
-        Fn::Base64: |
+        Fn::Base64: !Sub |
           #!/bin/bash
           yum update -y
           yum install -y mariadb-server
           systemctl enable mariadb
           systemctl start mariadb
+          # allow remote connections
+          sed -i 's/^bind-address.*/bind-address=0.0.0.0/' /etc/my.cnf.d/mariadb-server.cnf 2>/dev/null || true
+          echo "[mysqld]" >> /etc/my.cnf
+          echo "bind-address=0.0.0.0" >> /etc/my.cnf
+          systemctl restart mariadb
+          # create app database, table, and user
+          mysql -u root <<SQL
+          CREATE DATABASE madjapp;
+          USE madjapp;
+          CREATE TABLE users (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(100),
+            email VARCHAR(100),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+          CREATE USER 'webapp'@'%' IDENTIFIED BY '${DBPassword}';
+          GRANT ALL PRIVILEGES ON madjapp.* TO 'webapp'@'%';
+          FLUSH PRIVILEGES;
+          SQL
       Tags:
         - Key: Name
           Value: DatabaseServer
 
+  # Web server - installs Apache + PHP + signup form, connects to DB by private IP
+  WebServer:
+    Type: AWS::EC2::Instance
+    DependsOn: DatabaseServer
+    Properties:
+      ImageId: ami-0c02fb55956c7d316
+      InstanceType: t2.micro
+      KeyName: !Ref KeyName
+      SubnetId: !Ref MADJPublicSubnet
+      SecurityGroupIds:
+        - !Ref MADJWebSG
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd php php-mysqlnd
+            systemctl enable httpd
+            systemctl start httpd
+            # wait for database to accept connections
+            for i in {1..30}; do
+              if mysqladmin ping -h ${DBHost} -u webapp -p${DBPassword} --silent 2>/dev/null; then
+                break
+              fi
+              sleep 10
+            done
+            # build the signup form
+            cat > /var/www/html/index.php <<'PHP'
+            <!doctype html>
+            <html><head><title>MADJ Signup</title>
+            <style>body{font-family:sans-serif;max-width:640px;margin:3rem auto;padding:0 1rem}
+            input,button{padding:.5rem;margin:.25rem;font-size:1rem}
+            table{border-collapse:collapse;width:100%;margin-top:2rem}
+            th,td{border:1px solid #ccc;padding:.5rem;text-align:left}</style></head>
+            <body>
+            <h1>MADJ Signup</h1>
+            <p>This page lives on the public web server. When you submit the form,
+            the data is written to the MariaDB database running on a private EC2
+            instance that has no public IP.</p>
+            PHP
+            cat >> /var/www/html/index.php <<PHP
+            <?php
+            \$db = new mysqli('${DBHost}', 'webapp', '${DBPassword}', 'madjapp');
+            if (\$db->connect_error) { die('DB connection failed: ' . \$db->connect_error); }
+            if (\$_SERVER['REQUEST_METHOD'] === 'POST') {
+              \$name = \$db->real_escape_string(\$_POST['name'] ?? '');
+              \$email = \$db->real_escape_string(\$_POST['email'] ?? '');
+              if (\$name && \$email) {
+                \$db->query("INSERT INTO users (name, email) VALUES ('\$name', '\$email')");
+                echo "<p style='color:green'>Signed up: \$name</p>";
+              }
+            }
+            ?>
+            PHP
+            cat >> /var/www/html/index.php <<'PHP'
+            <form method="POST">
+              <input name="name" placeholder="Name" required>
+              <input name="email" type="email" placeholder="Email" required>
+              <button>Sign up</button>
+            </form>
+            <h2>Current signups (read from database)</h2>
+            <table><tr><th>ID</th><th>Name</th><th>Email</th><th>Signed up at</th></tr>
+            <?php
+            $r = $db->query("SELECT * FROM users ORDER BY id DESC");
+            while ($row = $r->fetch_assoc()) {
+              echo "<tr><td>{$row['id']}</td><td>{$row['name']}</td><td>{$row['email']}</td><td>{$row['created_at']}</td></tr>";
+            }
+            ?>
+            </table>
+            </body></html>
+            PHP
+            rm -f /var/www/html/index.html
+            systemctl restart httpd
+          - DBHost: !GetAtt DatabaseServer.PrivateIp
+      Tags:
+        - Key: Name
+          Value: WebServer
+
 Outputs:
-  WebServerIP:
-    Description: Public IP of the web server
-    Value: !GetAtt WebServer.PublicIp
+  WebServerURL:
+    Description: Open this in a browser to see the signup form
+    Value: !Sub http://${WebServer.PublicIp}
   DatabasePrivateIP:
-    Description: Private IP of the database server
+    Description: Private IP of the database server (not reachable from internet)
     Value: !GetAtt DatabaseServer.PrivateIp
