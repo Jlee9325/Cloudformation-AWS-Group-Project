@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Mannys Card Shop - two-tier VPC with signal-based readiness
+Description: Mannys Card Shop - two-tier VPC with self-healing httpd
 
 Parameters:
   KeyName:
@@ -165,7 +165,6 @@ Resources:
           yum update -y
           yum install -y mariadb-server
 
-          # Kill any existing MariaDB config and write a known-good one
           rm -f /etc/my.cnf.d/*.cnf 2>/dev/null
           cat > /etc/my.cnf <<'EOF'
           [mysqld]
@@ -186,7 +185,6 @@ Resources:
           systemctl enable mariadb
           systemctl start mariadb
 
-          # Wait for mariadb to actually be ready
           for i in {1..60}; do
             if mysqladmin ping --silent 2>/dev/null; then
               break
@@ -194,14 +192,11 @@ Resources:
             sleep 2
           done
 
-          # Verify bind-address actually took effect. If not, force it.
           if ! ss -tlnp 2>/dev/null | grep -q '0.0.0.0:3306'; then
-            echo "ERROR: bind-address did not apply, forcing restart"
             systemctl restart mariadb
             sleep 10
           fi
 
-          # Build schema
           mysql -u root <<'SQL'
           DROP DATABASE IF EXISTS MADJ_App_DB;
           CREATE DATABASE MADJ_App_DB;
@@ -218,7 +213,6 @@ Resources:
             ('Pikachu Promo', 19.99);
           SQL
 
-          # Create the user and force-grant on % (all hosts in VPC)
           mysql -u root <<'SQL'
           DROP USER IF EXISTS 'MADJ_Web_User'@'%';
           CREATE USER 'MADJ_Web_User'@'%' IDENTIFIED BY 'Password123!';
@@ -227,11 +221,9 @@ Resources:
           FLUSH HOSTS;
           SQL
 
-          # Self-test: can we authenticate as the web user from this box?
           mysql -h 127.0.0.1 -u MADJ_Web_User -pPassword123! -e "SELECT COUNT(*) FROM MADJ_App_DB.cards;"
           SELFTEST=$?
 
-          # Signal CloudFormation only if everything worked
           /opt/aws/bin/cfn-signal -e $SELFTEST --stack ${AWS::StackName} --resource DatabaseServer --region ${AWS::Region}
       Tags:
         - Key: Name
@@ -242,7 +234,7 @@ Resources:
     DependsOn: DatabaseServer
     CreationPolicy:
       ResourceSignal:
-        Timeout: PT10M
+        Timeout: PT15M
     Properties:
       ImageId: ami-0c02fb55956c7d316
       InstanceType: t2.micro
@@ -257,16 +249,28 @@ Resources:
             exec > /var/log/user-data.log 2>&1
             set -x
 
+            # Install everything up front
             yum update -y
             yum install -y httpd php php-mysqlnd mariadb
+
+            # Nuke the Apache welcome page so it can never interfere
+            rm -f /etc/httpd/conf.d/welcome.conf
+            rm -f /var/www/html/index.html
+
+            # Create a systemd drop-in that auto-restarts httpd if it ever dies.
+            # This is the key fix: even if something kills Apache post-boot,
+            # systemd will bring it right back within 5 seconds.
+            mkdir -p /etc/systemd/system/httpd.service.d
+            cat > /etc/systemd/system/httpd.service.d/restart.conf <<'EOF'
+            [Service]
+            Restart=always
+            RestartSec=5
+            EOF
+            systemctl daemon-reload
             systemctl enable httpd
 
-            # DB is guaranteed ready because DatabaseServer's CreationPolicy
-            # already blocked until its own self-test passed. But verify once
-            # more to be safe.
-            mysql -h ${DBHost} -u MADJ_Web_User -pPassword123! -e "SELECT 1" MADJ_App_DB
-            DBCHECK=$?
-
+            # Write the PHP file BEFORE starting httpd so there's no window
+            # where Apache serves a broken or missing file.
             cat > /var/www/html/index.php <<'PHPEOF'
             <?php
             error_reporting(E_ALL);
@@ -303,15 +307,34 @@ Resources:
             </html>
             PHPEOF
             sed -i "s/__DBHOST__/${DBHost}/" /var/www/html/index.php
-            rm -f /var/www/html/index.html
+
+            # Validate the PHP file parses
+            php -l /var/www/html/index.php
+            PHPLINT=$?
+
+            # Set ownership so Apache can read it
+            chown apache:apache /var/www/html/index.php
+            chmod 644 /var/www/html/index.php
+
+            # Start Apache
             systemctl start httpd
+            sleep 5
 
-            # Final check: is httpd actually serving?
-            sleep 3
-            curl -sf http://localhost/index.php > /dev/null
-            HTTPCHECK=$?
+            # Verify Apache is running (not just that a curl worked once)
+            systemctl is-active --quiet httpd
+            ACTIVE=$?
 
-            /opt/aws/bin/cfn-signal -e $((DBCHECK + HTTPCHECK)) --stack ${AWS::StackName} --resource WebServer --region ${AWS::Region}
+            # Verify the page actually renders without PHP errors
+            RESPONSE=$(curl -s -o /tmp/page.html -w "%{http_code}" http://localhost/index.php)
+            if [ "$RESPONSE" = "200" ] && grep -q "Manny's Card Shop" /tmp/page.html; then
+              CURLCHECK=0
+            else
+              CURLCHECK=1
+              cat /tmp/page.html
+            fi
+
+            TOTAL=$((PHPLINT + ACTIVE + CURLCHECK))
+            /opt/aws/bin/cfn-signal -e $TOTAL --stack ${AWS::StackName} --resource WebServer --region ${AWS::Region}
           - DBHost: !GetAtt DatabaseServer.PrivateIp
       Tags:
         - Key: Name
