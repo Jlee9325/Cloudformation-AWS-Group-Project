@@ -175,8 +175,6 @@ Resources:
           mysql -u root <<'SQL'
           DELETE FROM mysql.user WHERE User='';
           DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
-          DROP DATABASE IF EXISTS test;
-          DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
           FLUSH PRIVILEGES;
 
           CREATE DATABASE IF NOT EXISTS MADJ_App_DB;
@@ -192,8 +190,11 @@ Resources:
             ('Dark Magician', 39.99),
             ('Pikachu Promo', 19.99);
 
-          DROP USER IF EXISTS 'MADJ_Web_User'@'localhost';
-          DROP USER IF EXISTS 'MADJ_Web_User'@'127.0.0.1';
+          GRANT USAGE ON *.* TO 'MADJ_Web_User'@'localhost';
+          DROP USER 'MADJ_Web_User'@'localhost';
+          GRANT USAGE ON *.* TO 'MADJ_Web_User'@'127.0.0.1';
+          DROP USER 'MADJ_Web_User'@'127.0.0.1';
+          FLUSH PRIVILEGES;
           CREATE USER 'MADJ_Web_User'@'localhost' IDENTIFIED BY 'Password123!';
           CREATE USER 'MADJ_Web_User'@'127.0.0.1' IDENTIFIED BY 'Password123!';
           GRANT ALL PRIVILEGES ON MADJ_App_DB.* TO 'MADJ_Web_User'@'localhost';
