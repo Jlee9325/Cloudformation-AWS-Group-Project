@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Mannys Card Shop - two-tier VPC with self-healing httpd
+Description: Mannys Card Shop - with failure reason capture
 
 Parameters:
   KeyName:
@@ -162,8 +162,18 @@ Resources:
           exec > /var/log/user-data.log 2>&1
           set -x
 
-          yum update -y
-          yum install -y mariadb-server
+          REASON=""
+          EXITCODE=0
+
+          fail() {
+            REASON="$1"
+            EXITCODE=1
+            /opt/aws/bin/cfn-signal -e 1 -r "$REASON" --stack ${AWS::StackName} --resource DatabaseServer --region ${AWS::Region}
+            exit 1
+          }
+
+          yum update -y || fail "yum update failed"
+          yum install -y mariadb-server || fail "mariadb-server install failed"
 
           rm -f /etc/my.cnf.d/*.cnf 2>/dev/null
           cat > /etc/my.cnf <<'EOF'
@@ -183,21 +193,27 @@ Resources:
           EOF
 
           systemctl enable mariadb
-          systemctl start mariadb
+          systemctl start mariadb || fail "mariadb failed to start"
 
+          READY=0
           for i in {1..60}; do
             if mysqladmin ping --silent 2>/dev/null; then
+              READY=1
               break
             fi
             sleep 2
           done
+          [ $READY -eq 1 ] || fail "mariadb never became ready after 120s"
 
           if ! ss -tlnp 2>/dev/null | grep -q '0.0.0.0:3306'; then
             systemctl restart mariadb
             sleep 10
+            if ! ss -tlnp 2>/dev/null | grep -q '0.0.0.0:3306'; then
+              fail "mariadb not bound to 0.0.0.0 after restart"
+            fi
           fi
 
-          mysql -u root <<'SQL'
+          mysql -u root <<'SQL' || fail "schema creation failed"
           DROP DATABASE IF EXISTS MADJ_App_DB;
           CREATE DATABASE MADJ_App_DB;
           USE MADJ_App_DB;
@@ -213,7 +229,7 @@ Resources:
             ('Pikachu Promo', 19.99);
           SQL
 
-          mysql -u root <<'SQL'
+          mysql -u root <<'SQL' || fail "user creation failed"
           DROP USER IF EXISTS 'MADJ_Web_User'@'%';
           CREATE USER 'MADJ_Web_User'@'%' IDENTIFIED BY 'Password123!';
           GRANT ALL PRIVILEGES ON MADJ_App_DB.* TO 'MADJ_Web_User'@'%';
@@ -221,10 +237,14 @@ Resources:
           FLUSH HOSTS;
           SQL
 
-          mysql -h 127.0.0.1 -u MADJ_Web_User -pPassword123! -e "SELECT COUNT(*) FROM MADJ_App_DB.cards;"
-          SELFTEST=$?
+          # Self-test over the network socket exactly like the web server will
+          mysql -h 127.0.0.1 -u MADJ_Web_User -pPassword123! -e "SELECT COUNT(*) FROM MADJ_App_DB.cards;" 2>/tmp/dberr
+          if [ $? -ne 0 ]; then
+            ERR=$(cat /tmp/dberr | tr -d '\n' | head -c 200)
+            fail "selftest failed: $ERR"
+          fi
 
-          /opt/aws/bin/cfn-signal -e $SELFTEST --stack ${AWS::StackName} --resource DatabaseServer --region ${AWS::Region}
+          /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource DatabaseServer --region ${AWS::Region}
       Tags:
         - Key: Name
           Value: DatabaseServer
@@ -249,17 +269,17 @@ Resources:
             exec > /var/log/user-data.log 2>&1
             set -x
 
-            # Install everything up front
-            yum update -y
-            yum install -y httpd php php-mysqlnd mariadb
+            fail() {
+              /opt/aws/bin/cfn-signal -e 1 -r "$1" --stack ${AWS::StackName} --resource WebServer --region ${AWS::Region}
+              exit 1
+            }
 
-            # Nuke the Apache welcome page so it can never interfere
+            yum update -y || fail "yum update failed"
+            yum install -y httpd php php-mysqlnd mariadb || fail "package install failed"
+
             rm -f /etc/httpd/conf.d/welcome.conf
             rm -f /var/www/html/index.html
 
-            # Create a systemd drop-in that auto-restarts httpd if it ever dies.
-            # This is the key fix: even if something kills Apache post-boot,
-            # systemd will bring it right back within 5 seconds.
             mkdir -p /etc/systemd/system/httpd.service.d
             cat > /etc/systemd/system/httpd.service.d/restart.conf <<'EOF'
             [Service]
@@ -269,8 +289,6 @@ Resources:
             systemctl daemon-reload
             systemctl enable httpd
 
-            # Write the PHP file BEFORE starting httpd so there's no window
-            # where Apache serves a broken or missing file.
             cat > /var/www/html/index.php <<'PHPEOF'
             <?php
             error_reporting(E_ALL);
@@ -308,33 +326,25 @@ Resources:
             PHPEOF
             sed -i "s/__DBHOST__/${DBHost}/" /var/www/html/index.php
 
-            # Validate the PHP file parses
-            php -l /var/www/html/index.php
-            PHPLINT=$?
-
-            # Set ownership so Apache can read it
+            php -l /var/www/html/index.php || fail "php lint failed"
             chown apache:apache /var/www/html/index.php
             chmod 644 /var/www/html/index.php
 
-            # Start Apache
-            systemctl start httpd
+            systemctl start httpd || fail "httpd failed to start"
             sleep 5
+            systemctl is-active --quiet httpd || fail "httpd not active after start"
 
-            # Verify Apache is running (not just that a curl worked once)
-            systemctl is-active --quiet httpd
-            ACTIVE=$?
-
-            # Verify the page actually renders without PHP errors
             RESPONSE=$(curl -s -o /tmp/page.html -w "%{http_code}" http://localhost/index.php)
-            if [ "$RESPONSE" = "200" ] && grep -q "Manny's Card Shop" /tmp/page.html; then
-              CURLCHECK=0
-            else
-              CURLCHECK=1
-              cat /tmp/page.html
+            if [ "$RESPONSE" != "200" ]; then
+              BODY=$(head -c 300 /tmp/page.html | tr -d '\n')
+              fail "http $RESPONSE from localhost: $BODY"
+            fi
+            if ! grep -q "Manny" /tmp/page.html; then
+              BODY=$(head -c 300 /tmp/page.html | tr -d '\n')
+              fail "page content wrong: $BODY"
             fi
 
-            TOTAL=$((PHPLINT + ACTIVE + CURLCHECK))
-            /opt/aws/bin/cfn-signal -e $TOTAL --stack ${AWS::StackName} --resource WebServer --region ${AWS::Region}
+            /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource WebServer --region ${AWS::Region}
           - DBHost: !GetAtt DatabaseServer.PrivateIp
       Tags:
         - Key: Name
